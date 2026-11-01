@@ -1,10 +1,12 @@
 # Faultline
 
-Faultline is a local-first AWS security-event analysis tool. It turns selected CloudTrail API events into detections and groups related detections into explainable investigations. It analyzes activity over time; it does not scan cloud configuration or vulnerabilities. Project Blacklight addresses security posture; Faultline addresses observed activity. Running the tool needs no AWS credentials, network connection, or cloud resources.
+Faultline is a local-first AWS security-event analysis tool. It turns selected CloudTrail API events into detections and groups related detections into explainable investigations. It analyzes activity over time; it does not scan cloud configuration or vulnerabilities. Project Blacklight addresses security posture; Faultline addresses observed activity. Running the local tool needs no AWS credentials, network connection, or cloud resources.
 
 ## Current scope
 
 Phase 2 supports raw CloudTrail event objects and EventBridge envelopes in JSON, arrays, or JSON Lines. It detects AdministratorAccess attachment to an IAM role, STS AssumeRole, CloudTrail StopLogging, and CloudTrail DeleteTrail. Two correlation rules link policy attachment to later assumption of the *explicitly identified same role*, and StopLogging to later DeleteTrail of the *same trail*. Findings describe API activity, not confirmed compromise or verified cloud state.
+
+Phase 3 adds an optional AWS deployment template for default-bus EventBridge rules, SQS with a dead-letter queue, Lambda, and DynamoDB. The cloud Lambda uses the same normalizer, rules, correlation IDs, and event-time logic. Offline tests exercise both scenarios through simulated SQS batches. **No AWS stack has been deployed or verified.** Cloud reconciliation has documented bounds and narrower reprocessing than SQLite; see [AWS architecture](docs/AWS_ARCHITECTURE.md) and the [deployment runbook](docs/DEPLOYMENT.md).
 
 SQLite keeps events, versioned rule evaluations, detections, incidents, membership, linkage explanations, and incident history. A transactional migration preserves Phase 1 databases. Replaying events does not duplicate incidents. A dedicated reprocess command evaluates new rule versions against stored normalized events. Only selected fields are retained; source payloads and STS credentials are not stored.
 
@@ -47,4 +49,4 @@ Run `python -m pytest` and `python -m ruff check .`. GitHub Actions checks Pytho
 
 An AdministratorAccess attachment and an AssumeRole event can share an account, a caller principal and ARN, and an exact role ARN within 30 minutes. Faultline records those observed facts, the linking rule, and an ordered timeline. An analyst should check the approved change record, the role's trust policy, and subsequent session activity before deciding whether it is suspicious. If the attachment has only a role name and no trustworthy role ARN, the events remain separate.
 
-See the [architecture](docs/ARCHITECTURE.md), [rule catalog](docs/RULES.md), [threat model](docs/THREAT_MODEL.md), and [roadmap](docs/ROADMAP.md). AWS integration, response actions, and a dashboard remain planned.
+See the [architecture](docs/ARCHITECTURE.md), [rule catalog](docs/RULES.md), [threat model](docs/THREAT_MODEL.md), and [roadmap](docs/ROADMAP.md). Response actions and a dashboard remain planned.

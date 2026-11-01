@@ -15,7 +15,7 @@ The v2 SQLite schema separates:
 - **Incident membership and links:** detection membership plus versioned, explicit explanations for paired evidence. A detection belongs to one current incident.
 - **History:** audit records for migration, membership changes, supersession, rule reprocessing, and analyst assessment changes.
 
-No full CloudTrail payload, `responseElements`, credentials, STS session name, source IP, user agent, or error message is persisted. A later DynamoDB adapter can implement the same ingest, reprocess, incident query, and assessment operations; none exists yet.
+No full CloudTrail payload, `responseElements`, credentials, STS session name, source IP, user agent, or error message is persisted. Phase 3 adds a separate bounded DynamoDB adapter for the AWS Lambda runtime. It is not selected by the local CLI. See [AWS architecture](AWS_ARCHITECTURE.md) for its access patterns, consistency, and narrower reprocessing semantics.
 
 `--json` emits one object per command. Ingestion returns `records` and `summary`; incident listing returns `incidents`; a detail query or update returns `incident`; history lookup returns `incident_history`; reprocessing returns `reprocess`. Incident detail separates `observed_timeline`, `detections`, `correlation_conclusions`, `unknowns`, `unverified_possibilities`, `investigation_steps`, and `history`. `incidents history` can inspect a superseded incident after rekeying. Absent event fields are JSON `null`; unknown conclusions are written as explicit explanations. Times are UTC ISO 8601 strings. The output schema is stable within the 0.2 release; changes will be versioned with the package.
 

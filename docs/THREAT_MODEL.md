@@ -1,4 +1,4 @@
-# Local threat model
+# Threat model
 
 ## Assumptions and boundaries
 
@@ -13,6 +13,11 @@ Phase 2 reads local files supplied by an operator. The files and synthetic fixtu
 | Sensitive evidence exposure | Store allowlists known metadata and request fields; never stores raw response elements, STS credentials, error messages, or tokens | Selected identifiers and analyst assessments can still be sensitive; protect the SQLite file and JSON output |
 | SQLite corruption or migration failure | Known v1 schema check, transactional migration, `quick_check`, foreign-key and membership checks, uniqueness constraints | Local disk corruption and backup recovery are outside the tool; back up before migration |
 | Event ordering and partial evidence | Event-time sorting and persistent recomputation; missing actor or exact resource evidence prevents correlation | Late arrivals may change current incident grouping and ID; clocks or missing logs may mislead |
-| Future live AWS integration | Planned adapter boundary keeps rule logic independent of transport | Authentication, least privilege, delivery integrity, retries, and provenance must be designed before Phase 3 use |
+| AWS delivery and malformed SQS messages | EventBridge source rules and queue resource policy; bounded JSON parser and per-message acknowledgement | EventBridge and SQS are at-least-once/best-effort; delivery is not proof of benign or complete source data |
+| Cloud concurrency and hot scopes | Conditional transactions, scope revision, bounded neighborhood, partial SQS retry and DLQ | More than 16 connected detections needs operator recovery; live race and load behavior remain unverified |
+| Cloud data exposure | Specific-resource Lambda IAM, SQS/DynamoDB encryption, HTTPS SDK calls, seven-day log retention, no raw payload logging | Stored identifiers, assessments, SQS/DLQ bodies, and artifact bucket still require access control and retention review |
+| Cloud deployment and teardown | Explicit change-set review and stack deletion procedure; no automatic resource creation | CloudTrail coverage, account policy, cost, artifact lifecycle, and production monitoring require operator verification |
 
 Faultline's conclusions are limited to observed API metadata and deterministic relationships. It does not establish compromise, successful exfiltration, or verified current AWS state.
+
+The Phase 3 stack is locally verified only. It has not been deployed. Cloud security boundaries, failure recovery, and known limits are detailed in [AWS_ARCHITECTURE.md](AWS_ARCHITECTURE.md) and [DEPLOYMENT.md](DEPLOYMENT.md).

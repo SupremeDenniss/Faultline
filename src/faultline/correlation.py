@@ -95,6 +95,18 @@ def _key(context: DetectionContext) -> tuple[str | None, ...] | None:
     return (context.event.account_id, *actor, resource)
 
 
+def correlation_scope(context: DetectionContext) -> tuple[str | None, ...] | None:
+    """Stable evidence scope shared by the local and bounded cloud correlators."""
+    rule_id = context.detection.rule_id
+    if rule_id not in {"FLT-IAM-001", "FLT-STS-001", "FLT-CT-001", "FLT-CT-002"}:
+        return None
+    key = _key(context)
+    if key is None:
+        return None
+    family = "iam" if rule_id in ("FLT-IAM-001", "FLT-STS-001") else "trail"
+    return (family, *key)
+
+
 def _time(event: Event) -> datetime:
     return datetime.fromisoformat(event.occurred_at.replace("Z", "+00:00"))
 
@@ -123,11 +135,11 @@ def correlate(
         rule_id = context.detection.rule_id
         if rule_id not in {"FLT-IAM-001", "FLT-STS-001", "FLT-CT-001", "FLT-CT-002"}:
             continue
-        key = _key(context)
-        if key is None:
+        scope = correlation_scope(context)
+        if scope is None:
             continue
-        family = "iam" if rule_id in ("FLT-IAM-001", "FLT-STS-001") else "trail"
-        lookup = (family, key)
+        family = scope[0]
+        lookup = (family, scope[1:])
         if rule_id in starts:
             latest[lookup] = context
             continue

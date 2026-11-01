@@ -1,0 +1,239 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Faultline Phase 3 single-account API activity ingestion (no Trail is created)
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: demo
+    AllowedPattern: '[a-z][a-z0-9-]{1,20}'
+  ArtifactBucket:
+    Type: String
+    Description: Existing S3 bucket containing the Lambda ZIP
+  ArtifactKey:
+    Type: String
+    Description: S3 key of the Lambda ZIP
+  CorrelationWindowMinutes:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 1440
+Resources:
+  EventTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    Properties:
+      TableName: !Sub '${AWS::StackName}-events'
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification: {SSEEnabled: true}
+      AttributeDefinitions:
+        - {AttributeName: pk, AttributeType: S}
+        - {AttributeName: sk, AttributeType: S}
+      KeySchema:
+        - {AttributeName: pk, KeyType: HASH}
+        - {AttributeName: sk, KeyType: RANGE}
+      Tags:
+        - {Key: Application, Value: Faultline}
+        - {Key: Environment, Value: !Ref EnvironmentName}
+  IncidentTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    Properties:
+      TableName: !Sub '${AWS::StackName}-incidents'
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification: {SSEEnabled: true}
+      AttributeDefinitions:
+        - {AttributeName: pk, AttributeType: S}
+        - {AttributeName: sk, AttributeType: S}
+        - {AttributeName: gsi1pk, AttributeType: S}
+        - {AttributeName: gsi1sk, AttributeType: S}
+      KeySchema:
+        - {AttributeName: pk, KeyType: HASH}
+        - {AttributeName: sk, KeyType: RANGE}
+      GlobalSecondaryIndexes:
+        - IndexName: AccountTime
+          KeySchema:
+            - {AttributeName: gsi1pk, KeyType: HASH}
+            - {AttributeName: gsi1sk, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+      Tags:
+        - {Key: Application, Value: Faultline}
+        - {Key: Environment, Value: !Ref EnvironmentName}
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-dlq'
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+      Tags:
+        - {Key: Application, Value: Faultline}
+  IngestQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-ingest'
+      VisibilityTimeout: 180
+      MessageRetentionPeriod: 345600
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 5
+      Tags:
+        - {Key: Application, Value: Faultline}
+  IamApiRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Successful or failed AttachRolePolicy API events
+      EventBusName: default
+      State: ENABLED
+      EventPattern:
+        source: [aws.iam]
+        detail-type: [AWS API Call via CloudTrail]
+        detail:
+          eventSource: [iam.amazonaws.com]
+          eventName: [AttachRolePolicy]
+      Targets:
+        - {Id: FaultlineQueue, Arn: !GetAtt IngestQueue.Arn}
+  StsApiRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: AssumeRole is a read-only management event
+      EventBusName: default
+      State: ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS
+      EventPattern:
+        source: [aws.sts]
+        detail-type: [AWS API Call via CloudTrail]
+        detail:
+          eventSource: [sts.amazonaws.com]
+          eventName: [AssumeRole]
+      Targets:
+        - {Id: FaultlineQueue, Arn: !GetAtt IngestQueue.Arn}
+  CloudTrailApiRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: StopLogging and DeleteTrail API events
+      EventBusName: default
+      State: ENABLED
+      EventPattern:
+        source: [aws.cloudtrail]
+        detail-type: [AWS API Call via CloudTrail]
+        detail:
+          eventSource: [cloudtrail.amazonaws.com]
+          eventName: [StopLogging, DeleteTrail]
+      Targets:
+        - {Id: FaultlineQueue, Arn: !GetAtt IngestQueue.Arn}
+  EventBridgeQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref IngestQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EventsToFaultlineQueue
+            Effect: Allow
+            Principal: {Service: events.amazonaws.com}
+            Action: sqs:SendMessage
+            Resource: !GetAtt IngestQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn:
+                  - !GetAtt IamApiRule.Arn
+                  - !GetAtt StsApiRule.Arn
+                  - !GetAtt CloudTrailApiRule.Arn
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: DenyInsecureQueueTransport
+            Effect: Deny
+            Principal: '*'
+            Action: sqs:*
+            Resource: !GetAtt IngestQueue.Arn
+            Condition:
+              Bool: {aws:SecureTransport: 'false'}
+  DeadLetterQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref DeadLetterQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureDeadLetterTransport
+            Effect: Deny
+            Principal: '*'
+            Action: sqs:*
+            Resource: !GetAtt DeadLetterQueue.Arn
+            Condition:
+              Bool: {aws:SecureTransport: 'false'}
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FaultlineIngest
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReceiveQueue
+                Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes, sqs:ChangeMessageVisibility]
+                Resource: !GetAtt IngestQueue.Arn
+              - Sid: PersistEvidence
+                Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:Query]
+                Resource:
+                  - !GetAtt EventTable.Arn
+                  - !GetAtt IncidentTable.Arn
+                  - !Sub '${IncidentTable.Arn}/index/AccountTime'
+              - Sid: WriteLogs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-ingest:*'
+  IngestFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-ingest'
+      Runtime: python3.12
+      Architectures: [x86_64]
+      Handler: faultline.aws.handler.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref ArtifactKey
+      Timeout: 30
+      MemorySize: 256
+      ReservedConcurrentExecutions: 5
+      Environment:
+        Variables:
+          FAULTLINE_EVENT_TABLE: !Ref EventTable
+          FAULTLINE_INCIDENT_TABLE: !Ref IncidentTable
+          FAULTLINE_WINDOW_MINUTES: !Ref CorrelationWindowMinutes
+      Tags:
+        - {Key: Application, Value: Faultline}
+        - {Key: Environment, Value: !Ref EnvironmentName}
+  FunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-ingest'
+      RetentionInDays: 7
+  QueueMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    DependsOn: [EventBridgeQueuePolicy, FunctionLogGroup]
+    Properties:
+      EventSourceArn: !GetAtt IngestQueue.Arn
+      FunctionName: !Ref IngestFunction
+      Enabled: true
+      BatchSize: 10
+      FunctionResponseTypes: [ReportBatchItemFailures]
+      ScalingConfig: {MaximumConcurrency: 5}
+Outputs:
+  IngestQueueUrl: {Value: !Ref IngestQueue}
+  IngestQueueArn: {Value: !GetAtt IngestQueue.Arn}
+  DeadLetterQueueUrl: {Value: !Ref DeadLetterQueue}
+  DeadLetterQueueArn: {Value: !GetAtt DeadLetterQueue.Arn}
+  EventTableName: {Value: !Ref EventTable}
+  IncidentTableName: {Value: !Ref IncidentTable}
+  LambdaArn: {Value: !GetAtt IngestFunction.Arn}
+  IamRuleArn: {Value: !GetAtt IamApiRule.Arn}
+  StsRuleArn: {Value: !GetAtt StsApiRule.Arn}
+  CloudTrailRuleArn: {Value: !GetAtt CloudTrailApiRule.Arn}
