@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from datetime import UTC, datetime
 from typing import Any
 
@@ -17,7 +18,7 @@ _SOURCE = re.compile(r"^[A-Za-z0-9.-]{1,128}$")
 def _clean(value: Any, limit: int = 512) -> str | None:
     if not isinstance(value, str) or not value or len(value) > limit:
         return None
-    if any(ord(char) < 32 or ord(char) == 127 or 0xD800 <= ord(char) <= 0xDFFF for char in value):
+    if any(unicodedata.category(char) in {"Cc", "Cf", "Cs", "Zl", "Zp"} for char in value):
         return None
     return value
 
@@ -90,7 +91,7 @@ def normalize_record(value: Any) -> RecordResult:
     request = _object(request_raw)
     selected_request = {
         key: cleaned
-        for key in ("roleName", "policyArn", "name")
+        for key in ("roleName", "policyArn", "name", "roleArn")
         if (cleaned := _clean(request.get(key), 512)) is not None
     }
     resources = []
@@ -114,6 +115,10 @@ def normalize_record(value: Any) -> RecordResult:
         actor_arn=_clean(identity.get("arn")),
         principal_id=_clean(identity.get("principalId")),
         session_issuer_arn=_clean(session_issuer.get("arn")),
+        actor_account_id=(
+            account_value if (account_value := _clean(identity.get("accountId"), 12))
+            and _ACCOUNT.fullmatch(account_value) else None
+        ),
         resources=tuple(resources),
         request=selected_request,
         error_code=_clean(error_raw, 128),

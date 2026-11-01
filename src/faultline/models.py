@@ -18,6 +18,7 @@ class Event:
     actor_arn: str | None
     principal_id: str | None
     session_issuer_arn: str | None
+    actor_account_id: str | None
     resources: tuple[str, ...]
     request: dict[str, str]
     error_code: str | None
@@ -32,12 +33,29 @@ class Event:
 @dataclass(frozen=True, slots=True)
 class Detection:
     rule_id: str
+    rule_version: str
     severity: str
     title: str
     explanation: str
     resource: str
     event_reference: str
     evidence: dict[str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class CorrelationLink:
+    left_detection_id: str
+    right_detection_id: str
+    rule_id: str
+    rule_version: str
+    explanation: str
+
+
+@dataclass(frozen=True, slots=True)
+class IncidentGroup:
+    incident_id: str
+    detection_ids: tuple[str, ...]
+    links: tuple[CorrelationLink, ...]
 
 
 @dataclass(frozen=True, slots=True)

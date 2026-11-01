@@ -1,31 +1,50 @@
 # Faultline
 
-Faultline is a local-first, event-driven AWS security detection and incident recording tool. It analyzes activity over time. It does not scan vulnerabilities or configuration posture; that is the domain of tools such as Project Blacklight.
+Faultline is a local-first AWS security-event analysis tool. It turns selected CloudTrail API events into detections and groups related detections into explainable investigations. It analyzes activity over time; it does not scan cloud configuration or vulnerabilities. Project Blacklight addresses security posture; Faultline addresses observed activity. Running the tool needs no AWS credentials, network connection, or cloud resources.
 
-Phase 1 ingests CloudTrail-style JSON, normalizes events, runs two deterministic rules, and stores incidents in local SQLite. It has no AWS connection and takes no response actions.
+## Current scope
 
-## Install
+Phase 2 supports raw CloudTrail event objects and EventBridge envelopes in JSON, arrays, or JSON Lines. It detects AdministratorAccess attachment to an IAM role, STS AssumeRole, CloudTrail StopLogging, and CloudTrail DeleteTrail. Two correlation rules link policy attachment to later assumption of the *explicitly identified same role*, and StopLogging to later DeleteTrail of the *same trail*. Findings describe API activity, not confirmed compromise or verified cloud state.
 
-Requires Python 3.12 or newer. From the repository root:
+SQLite keeps events, versioned rule evaluations, detections, incidents, membership, linkage explanations, and incident history. A transactional migration preserves Phase 1 databases. Replaying events does not duplicate incidents. A dedicated reprocess command evaluates new rule versions against stored normalized events. Only selected fields are retained; source payloads and STS credentials are not stored.
+
+## Install and run
+
+Requires Python 3.12 or newer. From this repository:
 
 ```sh
 python -m venv .venv
 ```
 
-Activate the environment (`.venv\Scripts\Activate.ps1` on PowerShell or `source .venv/bin/activate` on Linux/macOS), then:
+Activate with `.venv\Scripts\Activate.ps1` in Windows PowerShell or `source .venv/bin/activate` on Linux/macOS, then:
 
 ```sh
 python -m pip install -e ".[dev]"
-faultline --db .faultline/demo.db demo
-faultline --db .faultline/demo.db incidents list
-faultline --db .faultline/demo.db incidents show <incident-id>
+faultline --db .faultline/iam.db demo --scenario iam
+faultline --db .faultline/trail.db demo --scenario trail
+faultline --db .faultline/iam.db incidents list
+faultline --db .faultline/iam.db incidents show <incident-id>
 ```
 
-The demo uses only synthetic fixtures and prints two detections, a benign event, a failed API call, a duplicate, and an invalid record. Its database lives under `.faultline/`, which Git ignores. Repeating the demo demonstrates deduplication.
+`demo` without `--scenario` retains the Phase 1 synthetic demonstration. `demo --scenario all` runs both Phase 2 scenarios in one database. All fixture accounts and identities are fictional; fixtures are not authenticated AWS events.
 
-Ingest your own local JSON object, JSON array, or JSON Lines file with `faultline --db .faultline/local.db ingest --file path/to/events.jsonl`. File size is limited to 10 MiB, record count to 10,000, and each record to 256 KiB. Invalid records are reported without stopping valid records. Input data is untrusted; avoid supplying sensitive source files because the input itself remains on disk wherever you placed it. Faultline retains only selected normalized metadata and rule evidence.
+For another local input file:
 
-Run checks with `python -m pytest` and `python -m ruff check .`.
+```sh
+faultline --db .faultline/local.db --window-minutes 30 ingest --file path/to/events.jsonl
+faultline --db .faultline/local.db --json incidents list
+faultline --db .faultline/local.db --json incidents show <incident-id>
+faultline --db .faultline/local.db --json incidents history <incident-id>
+faultline --db .faultline/local.db incidents update <incident-id> --status investigating --assessment "Reviewing approved change"
+faultline --db .faultline/local.db reprocess
+```
 
-See [architecture](docs/ARCHITECTURE.md) and [roadmap](docs/ROADMAP.md). AWS integration, correlation, response actions, and a dashboard are planned; none are implemented in Phase 1.
-﻿
+The correlation window defaults to 30 minutes and is fixed when a database is created; use a new database for a different window. `--json` precedes the command and emits one JSON value. Input is limited to 10 MiB, 10,000 records, and 256 KiB per record. Invalid records are diagnosed without executing payload content. A file with invalid records exits with code 1 after valid records have been processed; unreadable or unsafe files exit with code 2.
+
+Run `python -m pytest` and `python -m ruff check .`. GitHub Actions checks Python 3.12 and 3.14 on Windows and Linux.
+
+## Investigation example
+
+An AdministratorAccess attachment and an AssumeRole event can share an account, a caller principal and ARN, and an exact role ARN within 30 minutes. Faultline records those observed facts, the linking rule, and an ordered timeline. An analyst should check the approved change record, the role's trust policy, and subsequent session activity before deciding whether it is suspicious. If the attachment has only a role name and no trustworthy role ARN, the events remain separate.
+
+See the [architecture](docs/ARCHITECTURE.md), [rule catalog](docs/RULES.md), [threat model](docs/THREAT_MODEL.md), and [roadmap](docs/ROADMAP.md). AWS integration, response actions, and a dashboard remain planned.

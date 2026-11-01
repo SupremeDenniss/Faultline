@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "faultline"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local-first AWS security event detection and incident recording"
 readme = "README.md"
 requires-python = ">=3.12"
