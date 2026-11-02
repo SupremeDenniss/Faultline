@@ -14,7 +14,7 @@ python -m ruff check .
 cfn-lint -t infra/cloudformation/faultline.yaml
 ```
 
-On Windows, use `py -3.12` in place of `python` if needed; on Linux, use `python3.12`. The build writes `.zip.sha256` beside the artifact. The verifier checks the handler path, required modules, Python 3.12 syntax, pure Python wheels, and absence of obvious credentials and development files. It does not prove Lambda execution. Review the ZIP and checksum before upload. The stack points to an existing S3 object; CloudFormation does not build or upload code. Build again for code changes, use a new object key, and review a stack update.
+On Windows, use `py -3.12` in place of `python` if needed; on Linux, use `python3.12`. The build writes `.zip.sha256` beside the artifact. It removes only SDK documentation/example members whose hashes match the pinned wheel `RECORD` manifests, retaining DynamoDB service models. The verifier checks the handler path, required modules, Python 3.12 syntax, pure Python wheels, credential patterns, and development files. The build also imports the extracted handler and loads the DynamoDB model with Python 3.12. These checks do not prove Lambda execution in AWS. Review the ZIP and checksum before upload. The stack points to an existing S3 object; CloudFormation does not build or upload code. Build again for code changes, use a new object key, and review a stack update.
 
 ## 2. Read-only AWS preflight
 

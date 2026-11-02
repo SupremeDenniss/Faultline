@@ -10,7 +10,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-from verify_lambda import verify_zip
+from verify_lambda import prune_verified_vendor_examples, runtime_check_zip, verify_zip
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_MODULES = (
@@ -47,6 +47,7 @@ def main() -> int:
              "-r", str(ROOT / "infra/requirements-lambda.txt")],
             check=True,
         )
+        removed = prune_verified_vendor_examples(stage)
         with zipfile.ZipFile(
             output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
         ) as archive:
@@ -59,10 +60,11 @@ def main() -> int:
                 info.external_attr = 0o644 << 16
                 archive.writestr(info, path.read_bytes())
     digest = verify_zip(output)
+    runtime_check_zip(output)
     output.with_suffix(".zip.sha256").write_text(
         f"{digest}  {output.name}\n", encoding="ascii"
     )
-    print(f"{output}\nSHA-256 {digest}")
+    print(f"{output}\nExcluded verified SDK examples: {len(removed)}\nSHA-256 {digest}")
     return 0
 
 

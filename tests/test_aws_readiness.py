@@ -273,16 +273,19 @@ def _verifier():
 
 def _zip_with(extra: dict[str, bytes] | None = None, omit: str | None = None) -> bytes:
     verifier = _verifier()
+    extra = extra or {}
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w") as archive:
         for name in verifier.REQUIRED:
             if name == omit:
                 continue
-            archive.writestr(name, b"def lambda_handler(event, context): pass\n" if
-                             name == "faultline/aws/handler.py" else b"pass\n")
+            default = (b"def lambda_handler(event, context): pass\n" if
+                       name == "faultline/aws/handler.py" else b"pass\n")
+            archive.writestr(name, extra.get(name, default))
         archive.writestr("boto3-1.0.dist-info/WHEEL", b"Wheel-Version: 1.0\nTag: py3-none-any\n")
-        for name, data in (extra or {}).items():
-            archive.writestr(name, data)
+        for name, data in extra.items():
+            if name not in verifier.REQUIRED:
+                archive.writestr(name, data)
     return output.getvalue()
 
 
@@ -300,8 +303,87 @@ def test_artifact_verification_detects_missing_and_unsafe_files(tmp_path: Path) 
     path.write_bytes(_zip_with(omit="faultline/aws/handler.py"))
     with pytest.raises(ValueError):
         verifier.verify_zip(path)
+    path.write_bytes(_zip_with(omit="urllib3/__init__.py"))
+    with pytest.raises(ValueError, match="required_runtime_file_missing"):
+        verifier.verify_zip(path)
     path.write_bytes(_zip_with({"extra.txt": b"AKIA1234567890123456"}))
     with pytest.raises(ValueError):
+        verifier.verify_zip(path)
+
+
+def test_vendor_examples_pruned_only_with_matching_wheel_records(tmp_path: Path) -> None:
+    import base64
+    import hashlib
+
+    verifier = _verifier()
+    stage = tmp_path / "package"
+    examples = {
+        "boto3/examples/cloudfront.rst": b"Public example " + b"AKIA" + b"A" * 16,
+        "botocore/data/iam/2010-05-08/examples-1.json": (
+            b"Example " + b"-----BEGIN " + b"PRIVATE KEY-----"
+        ),
+        "botocore/data/sts/2011-06-15/examples-1.json": b"Public example",
+    }
+    for name, data in examples.items():
+        path = stage / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    service_model = stage / "botocore/data/dynamodb/2012-08-10/service-2.json.gz"
+    service_model.parent.mkdir(parents=True, exist_ok=True)
+    service_model.write_bytes(b"required runtime model")
+    for vendor in ("boto3", "botocore"):
+        manifest = stage / f"{vendor}-1.43.30.dist-info/RECORD"
+        manifest.parent.mkdir(parents=True)
+        rows = []
+        for name, data in examples.items():
+            if name.startswith(vendor + "/"):
+                digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).decode().rstrip(
+                    "="
+                )
+                rows.append(f"{name},sha256={digest},{len(data)}")
+        manifest.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    assert set(verifier.prune_verified_vendor_examples(stage)) == set(examples)
+    assert all(not (stage / name).exists() for name in examples)
+    assert service_model.exists()
+
+
+def test_vendor_example_tamper_blocks_pruning(tmp_path: Path) -> None:
+    verifier = _verifier()
+    example = tmp_path / "boto3/examples/cloudfront.rst"
+    example.parent.mkdir(parents=True)
+    example.write_bytes(b"tampered vendor example")
+    manifest = tmp_path / "boto3-1.43.30.dist-info/RECORD"
+    manifest.parent.mkdir()
+    manifest.write_text("boto3/examples/cloudfront.rst,sha256=wrong,23\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="vendor_example_provenance_mismatch"):
+        verifier.prune_verified_vendor_examples(tmp_path)
+    assert example.exists()
+
+
+@pytest.mark.parametrize("member,content,category", [
+    ("faultline/aws/handler.py", b"# " + b"AKIA" + b"B" * 16 + b"\n"
+     b"def lambda_handler(event, context): pass\n", "aws_access_key_pattern"),
+    ("unexpected_dependency.py", b"# -----BEGIN PRIVATE KEY-----\n", "pem_private_key_header"),
+])
+def test_unexpected_credentials_still_fail_with_safe_member_diagnostics(
+    tmp_path: Path, member: str, content: bytes, category: str,
+) -> None:
+    verifier = _verifier()
+    path = tmp_path / "artifact.zip"
+    path.write_bytes(_zip_with({member: content}))
+    with pytest.raises(ValueError) as error:
+        verifier.verify_zip(path)
+    message = str(error.value)
+    assert f"member={member!r}" in message
+    assert f"category={category}" in message
+    assert "AKIA" not in message and "PRIVATE KEY" not in message
+
+
+def test_unpruned_vendor_example_is_rejected(tmp_path: Path) -> None:
+    verifier = _verifier()
+    path = tmp_path / "artifact.zip"
+    path.write_bytes(_zip_with({"boto3/examples/cloudfront.rst": b"public example"}))
+    with pytest.raises(ValueError, match="unpruned_vendor_example"):
         verifier.verify_zip(path)
 
 

@@ -25,7 +25,6 @@ faultline = ["fixtures/*.jsonl"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--basetemp=.pytest_tmp"
 
 [tool.ruff]
 target-version = "py312"
