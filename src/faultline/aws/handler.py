@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -9,11 +10,17 @@ from collections import Counter
 from collections.abc import Callable
 from typing import Any
 
-from faultline.aws.gateway import Boto3Gateway
-from faultline.aws.store import DynamoStore
+from faultline.aws.gateway import Boto3Gateway, ConflictError
+from faultline.aws.store import (
+    CloudCapacityError,
+    CloudIntegrityError,
+    DynamoStore,
+    UnsupportedReprocess,
+)
 from faultline.normalize import normalize_record
 
 _LOG = logging.getLogger(__name__)
+_LOG.setLevel(logging.INFO)
 _MAX_BODY_BYTES = 256 * 1024
 _OPERATIONS = {
     "aws.iam": ("iam.amazonaws.com", {"AttachRolePolicy"}),
@@ -100,12 +107,28 @@ def process_sqs_batch(
             if store is None:
                 store = store_factory()
             outcome = store.ingest(result.event)
-            counts["inserted" if outcome.inserted else "duplicate"] += 1
-        except Exception:
+            outcome_name = "inserted" if outcome.inserted else "duplicate"
+            counts[outcome_name] += 1
+            event_ref = hashlib.sha256(result.event.identity.encode()).hexdigest()[:16]
+            _LOG.info("Faultline event outcome=%s event_ref=%s", outcome_name, event_ref)
+        except Exception as exc:
             # The original SQS message is retried and eventually moved to the DLQ.
             # Never log exception text: providers can place source values in it.
+            if isinstance(exc, CloudCapacityError):
+                category = "capacity"
+            elif isinstance(exc, UnsupportedReprocess):
+                category = "unsupported_reprocess"
+            elif isinstance(exc, CloudIntegrityError):
+                category = "integrity"
+            elif isinstance(exc, ConflictError):
+                category = "conflict"
+            else:
+                category = "infrastructure"
+            reference = hashlib.sha256(message_id.encode()).hexdigest()[:12]
+            _LOG.warning("Faultline ingestion failure category=%s message_ref=%s",
+                         category, reference)
             failures.append({"itemIdentifier": message_id})
-            counts["failed"] += 1
+            counts[f"failed_{category}"] += 1
     _LOG.info("Faultline SQS batch counts: %s", dict(counts))
     return {"batchItemFailures": failures}
 

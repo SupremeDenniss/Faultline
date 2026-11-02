@@ -1,15 +1,22 @@
-"""Build a repeatable, self-contained Python 3.12 Lambda ZIP on Windows or Linux."""
+"""Build the Python 3.12 Linux x86_64 Lambda ZIP without touching AWS."""
 
 from __future__ import annotations
 
 import argparse
+import shutil
 import subprocess
 import sys
 import tempfile
 import zipfile
 from pathlib import Path
 
+from verify_lambda import verify_zip
+
 ROOT = Path(__file__).resolve().parents[1]
+RUNTIME_MODULES = (
+    "__init__.py", "models.py", "normalize.py", "rules.py", "correlation.py",
+    "aws/__init__.py", "aws/gateway.py", "aws/store.py", "aws/handler.py",
+)
 
 
 def main() -> int:
@@ -27,15 +34,17 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as temporary:
         stage = Path(temporary) / "package"
         stage.mkdir()
+        for module in RUNTIME_MODULES:
+            source = ROOT / "src/faultline" / module
+            destination = stage / "faultline" / module
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, destination)
         subprocess.run(
             [sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
-             "--no-compile", "--target", str(stage), "--no-deps", str(ROOT)],
-            check=True,
-        )
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
-             "--no-compile", "--target", str(stage), "--no-deps", "-r",
-             str(ROOT / "infra/requirements-lambda.txt")],
+             "--no-compile", "--no-deps", "--only-binary=:all:",
+             "--platform", "manylinux2014_x86_64", "--implementation", "cp",
+             "--python-version", "3.12", "--target", str(stage),
+             "-r", str(ROOT / "infra/requirements-lambda.txt")],
             check=True,
         )
         with zipfile.ZipFile(
@@ -48,8 +57,12 @@ def main() -> int:
                 info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
                 info.compress_type = zipfile.ZIP_DEFLATED
                 info.external_attr = 0o644 << 16
-                archive.writestr(info, path.read_bytes(), compress_type=zipfile.ZIP_DEFLATED)
-    print(output)
+                archive.writestr(info, path.read_bytes())
+    digest = verify_zip(output)
+    output.with_suffix(".zip.sha256").write_text(
+        f"{digest}  {output.name}\n", encoding="ascii"
+    )
+    print(f"{output}\nSHA-256 {digest}")
     return 0
 
 

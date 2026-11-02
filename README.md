@@ -8,6 +8,8 @@ Phase 2 supports raw CloudTrail event objects and EventBridge envelopes in JSON,
 
 Phase 3 adds an optional AWS deployment template for default-bus EventBridge rules, SQS with a dead-letter queue, Lambda, and DynamoDB. The cloud Lambda uses the same normalizer, rules, correlation IDs, and event-time logic. Offline tests exercise both scenarios through simulated SQS batches. **No AWS stack has been deployed or verified.** Cloud reconciliation has documented bounds and narrower reprocessing than SQLite; see [AWS architecture](docs/AWS_ARCHITECTURE.md) and the [deployment runbook](docs/DEPLOYMENT.md).
 
+Phase 3B adds a read-only AWS preflight command, Linux Lambda ZIP validation, deployed-resource inspection, and a separately gated direct-SQS smoke test. These tools are prepared for a future authorized deployment; no live AWS validation has occurred.
+
 SQLite keeps events, versioned rule evaluations, detections, incidents, membership, linkage explanations, and incident history. A transactional migration preserves Phase 1 databases. Replaying events does not duplicate incidents. A dedicated reprocess command evaluates new rule versions against stored normalized events. Only selected fields are retained; source payloads and STS credentials are not stored.
 
 ## Install and run

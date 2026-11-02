@@ -10,9 +10,10 @@ from pathlib import Path
 import pytest
 import yaml
 
-from faultline.aws.gateway import ConflictError, Put
+from faultline.aws.gateway import ConflictError, Page, Put
 from faultline.aws.handler import process_sqs_batch
-from faultline.aws.store import DynamoStore, UnsupportedReprocess
+from faultline.aws.live_validation import synthetic_envelopes
+from faultline.aws.store import CloudCapacityError, DynamoStore, UnsupportedReprocess
 from faultline.normalize import normalize_record
 from faultline.rules import AttachAdministratorPolicy
 
@@ -61,6 +62,26 @@ class MemoryGateway:
                 key=lambda item: item["gsi1sk"], reverse=True,
             )
         ][:limit]
+
+    def query_range_page(
+        self, table: str, pk: str, start: str, end: str, limit: int,
+        cursor: dict | None = None,
+    ) -> Page:
+        items = self.query_range(table, pk, start, end, 10_000)
+        offset = int(cursor["offset"]) if cursor else 0
+        end_offset = offset + limit
+        return Page(items[offset:end_offset], {"offset": end_offset}
+                    if end_offset < len(items) else None)
+
+    def query_account_page(
+        self, table: str, account_id: str, limit: int,
+        cursor: dict | None = None,
+    ) -> Page:
+        items = self.query_account(table, account_id, 10_000)
+        offset = int(cursor["offset"]) if cursor else 0
+        end_offset = offset + limit
+        return Page(items[offset:end_offset], {"offset": end_offset}
+                    if end_offset < len(items) else None)
 
     def transact(self, puts: list[Put]) -> None:
         if self.conflict_once:
@@ -169,7 +190,9 @@ def test_malformed_and_duplicate_json_are_acknowledged() -> None:
     assert len(current_incidents(gateway)) == 1
 
 
-def test_bounded_operational_failure_isolated_from_valid_message() -> None:
+def test_bounded_operational_failure_isolated_from_valid_message(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     gateway = MemoryGateway()
     large = copy.deepcopy(fixture("demo-iam.jsonl")[0])
     large["eventID"] = "large-event"
@@ -179,6 +202,8 @@ def test_bounded_operational_failure_isolated_from_valid_message() -> None:
     assert process_sqs_batch(batch, lambda: DynamoStore(gateway, "events", "incidents")) == {
         "batchItemFailures": [{"itemIdentifier": "large"}]
     }
+    assert "category=capacity" in caplog.text
+    assert "arn:aws:iam" not in caplog.text
     assert len(current_incidents(gateway)) == 1
 
 
@@ -236,6 +261,87 @@ def test_explicit_additive_rule_reprocess_and_deactivation_limit() -> None:
     assert any(key[2] == "EVAL#FLT-IAM-001#2.0.0" for key in gateway.items)
     with pytest.raises(UnsupportedReprocess):
         store.reprocess_event(event.account_id, event.event_id, rules=(V3(),))
+    blocks = store.get_reprocess_blocks(event.account_id, event.event_id)
+    assert len(blocks) == 1
+    assert blocks[0]["reason_code"] == "DEACTIVATION_UNSUPPORTED"
+    assert store.get_incident(incident_id)["reprocess_blocks"][0]["reason_code"] == (
+        "DEACTIVATION_UNSUPPORTED"
+    )
+    assert any(item["action"] == "rule_reprocess_blocked" for item in
+               store.get_history(incident_id))
+
+
+def test_paginated_account_and_history_reads_are_explicit() -> None:
+    gateway = MemoryGateway()
+    store = DynamoStore(gateway, "events", "incidents")
+    raw = fixture("demo-iam.jsonl")[0]
+    for i in range(3):
+        event = copy.deepcopy(raw)
+        event["eventID"] = f"paged-{i}"
+        store.ingest(normalize_record(event).event)
+    first = store.list_account_incidents_page("111122223333", limit=2)
+    assert len(first.items) == 2 and first.cursor is not None
+    second = store.list_account_incidents_page("111122223333", limit=2,
+                                               cursor=first.cursor)
+    assert len(second.items) == 1 and second.cursor is None
+    with pytest.raises(CloudCapacityError):
+        store.list_account_incidents("111122223333", limit=2)
+    incident_id = first.items[0]["incident_id"]
+    assert store.update_incident(incident_id, status="investigating")
+    history_first = store.get_history_page(incident_id, limit=1)
+    assert history_first.cursor is not None
+    history_second = store.get_history_page(incident_id, limit=1,
+                                            cursor=history_first.cursor)
+    assert history_second.cursor is None
+    with pytest.raises(CloudCapacityError):
+        store.get_history(incident_id, limit=1)
+
+
+def test_scope_capacity_boundary_and_recovery_marker() -> None:
+    gateway = MemoryGateway()
+    store = DynamoStore(gateway, "events", "incidents")
+    raw = fixture("demo-iam.jsonl")[0]
+    for i in range(16):
+        event = copy.deepcopy(raw)
+        event["eventID"] = f"scope-{i}"
+        store.ingest(normalize_record(event).event)
+    extra = copy.deepcopy(raw)
+    extra["eventID"] = "scope-overflow"
+    with pytest.raises(CloudCapacityError):
+        store.ingest(normalize_record(extra).event)
+    assert gateway.get("events", "EVENT#111122223333:scope-overflow", "META") is not None
+    assert len(current_incidents(gateway)) == 16
+
+
+def test_concurrent_assessment_retry_preserves_history() -> None:
+    gateway = MemoryGateway()
+    store = DynamoStore(gateway, "events", "incidents")
+    store.ingest(normalize_record(fixture("demo-iam.jsonl")[0]).event)
+    identifier = current_incidents(gateway)[0]["incident_id"]
+    gateway.conflict_once = True
+    assert store.update_incident(identifier, status="investigating", assessment="Approved review")
+    history = store.get_history(identifier)
+    assert [item["action"] for item in history].count("assessment_updated") == 1
+    assert store.get_incident(identifier)["assessment"] == "Approved review"
+
+
+def test_phase3b_synthetic_envelopes_through_lambda_path(caplog: pytest.LogCaptureFixture) -> None:
+    gateway = MemoryGateway()
+    events = synthetic_envelopes("offline-validation", "123456789012", "us-east-1")
+    batch = {"Records": [message(str(i), item) for i, item in enumerate(events)]}
+    assert process_sqs_batch(batch, lambda: DynamoStore(gateway, "events", "incidents")) == {
+        "batchItemFailures": []
+    }
+    incidents = current_incidents(gateway)
+    assert len(incidents) == 2
+    assert all(len(item["members"]) == 2 for item in incidents)
+    gateway.fail_once = False
+    assert process_sqs_batch(batch, lambda: DynamoStore(gateway, "events", "incidents")) == {
+        "batchItemFailures": []
+    }
+    assert len(current_incidents(gateway)) == 2
+    assert "responseElements" not in json.dumps(list(gateway.items.values()))
+    assert "secretAccessKey" not in caplog.text
 
 
 @pytest.mark.parametrize("change", ["account", "principal"])

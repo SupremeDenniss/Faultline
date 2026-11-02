@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from faultline.aws.gateway import ConflictError, Gateway, Put
+from faultline.aws.gateway import ConflictError, Gateway, Page, Put
 from faultline.correlation import (
     DetectionContext,
     correlate,
@@ -122,6 +122,7 @@ class DynamoStore:
             if existing and finding is None and _version(rule.version) > _version(
                 existing["detection"]["rule_version"]
             ):
+                self._mark_blocked(event, rule, "DEACTIVATION_UNSUPPORTED")
                 raise UnsupportedReprocess(
                     "cloud reprocessing cannot deactivate a prior detection"
                 )
@@ -134,10 +135,76 @@ class DynamoStore:
             if finding is None:
                 continue
             context = DetectionContext(event, finding)
-            scope_pk, index_sk = self._persist_detection(context, existing)
+            try:
+                scope_pk, index_sk = self._persist_detection(context, existing)
+            except UnsupportedReprocess:
+                self._mark_blocked(event, rule, "SCOPE_OR_VERSION_UNSUPPORTED")
+                raise
             detection_ids.append(identifier)
             incident_ids.extend(self._reconcile(scope_pk, index_sk, event.occurred_at))
         return IngestOutcome(inserted, tuple(detection_ids), tuple(sorted(set(incident_ids))))
+
+    def _mark_blocked(self, event: Event, rule: Rule, reason_code: str) -> None:
+        event_pk = f"EVENT#{event.identity}"
+        self.gateway.put_if_absent(self.event_table, {
+            "pk": event_pk, "sk": f"BLOCK#{rule.rule_id}#{rule.version}",
+            "rule_id": rule.rule_id, "rule_version": rule.version,
+            "reason_code": reason_code, "observed_at": _now(),
+        })
+        identifier = detection_id(event, rule.rule_id)
+        meta = self.gateway.get(self.event_table, f"DETECTION#{identifier}", "META")
+        if meta is None:
+            return
+        warning = {"event_reference": event.identity, "rule_id": rule.rule_id,
+                   "rule_version": rule.version, "reason_code": reason_code}
+        for _attempt in range(MAX_RETRIES):
+            indexed = self.gateway.get(self.event_table, meta["scope_pk"], meta["scope_sk"])
+            if indexed is None or not indexed.get("incident_id"):
+                return
+            incident_id_value = indexed["incident_id"]
+            incident = self.get_incident(incident_id_value)
+            if incident is None or not incident.get("is_current"):
+                continue
+            warnings = incident.get("reprocess_blocks", [])
+            if warning in warnings:
+                return
+            if len(warnings) >= MAX_CONTEXTS:
+                raise CloudCapacityError("incident reprocess block list is full")
+            revision = int(incident["revision"])
+            now = _now()
+            updated = {**incident, "reprocess_blocks": [*warnings, warning],
+                       "revision": revision + 1, "updated_at": now}
+            history = Put(self.incident_table, {
+                "pk": f"INCIDENT#{incident_id_value}",
+                "sk": f"HIST#REPROCESS_BLOCK#{revision + 1:012d}",
+                "changed_at": now, "action": "rule_reprocess_blocked",
+                "details": warning,
+            })
+            try:
+                self.gateway.transact([
+                    Put(self.incident_table, updated, revision), history
+                ])
+                return
+            except ConflictError:
+                continue
+        raise ConflictError("reprocess block annotation exceeded retry limit")
+
+    def get_reprocess_blocks(self, account_id: str, event_id: str) -> list[dict[str, Any]]:
+        page = self.get_reprocess_blocks_page(account_id, event_id)
+        if page.cursor is not None:
+            raise CloudCapacityError("reprocessing block list requires pagination")
+        return page.items
+
+    def get_reprocess_blocks_page(
+        self, account_id: str, event_id: str, limit: int = 100,
+        cursor: dict[str, Any] | None = None,
+    ) -> Page:
+        if not 1 <= limit <= 100:
+            raise ValueError("block list limit must be 1-100")
+        return self.gateway.query_range_page(
+            self.event_table, f"EVENT#{account_id}:{event_id}", "BLOCK#", "BLOCK#~",
+            limit, cursor,
+        )
 
     def reprocess_event(
         self, account_id: str, event_id: str, rules: tuple[Rule, ...] = RULES
@@ -400,6 +467,7 @@ class DynamoStore:
             },
             "status": source["status"] if source else "open",
             "assessment": source.get("assessment") if source else None,
+            "reprocess_blocks": source.get("reprocess_blocks", []) if source else [],
             "created_at": source["created_at"] if source else now,
             "updated_at": now,
             "is_current": True,
@@ -425,20 +493,43 @@ class DynamoStore:
         return self.gateway.get(self.incident_table, f"INCIDENT#{incident_id}", "META")
 
     def list_account_incidents(self, account_id: str, limit: int = 50) -> list[dict[str, Any]]:
-        """Bounded, eventually consistent discovery with current-state rechecks."""
+        """Convenience read that refuses to silently drop a second page."""
+        page = self.list_account_incidents_page(account_id, limit)
+        if page.cursor is not None:
+            raise CloudCapacityError("account incident listing requires pagination")
+        return page.items
+
+    def list_account_incidents_page(
+        self, account_id: str, limit: int = 50,
+        cursor: dict[str, Any] | None = None,
+    ) -> Page:
+        """Bounded GSI discovery with strongly consistent current-state rechecks."""
         if not (len(account_id) == 12 and account_id.isascii() and account_id.isdigit()):
             raise ValueError("account ID must be twelve digits")
         if not 1 <= limit <= 100:
             raise ValueError("incident limit must be 1-100")
-        candidates = self.gateway.query_account(self.incident_table, account_id, limit)
-        current = [self.get_incident(item["incident_id"]) for item in candidates]
-        return [item for item in current if item and item["is_current"]]
+        candidates = self.gateway.query_account_page(
+            self.incident_table, account_id, limit, cursor
+        )
+        current = [self.get_incident(item["incident_id"]) for item in candidates.items]
+        return Page([item for item in current if item and item["is_current"]],
+                    candidates.cursor)
 
     def get_history(self, incident_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        page = self.get_history_page(incident_id, limit)
+        if page.cursor is not None:
+            raise CloudCapacityError("incident history requires pagination")
+        return page.items
+
+    def get_history_page(
+        self, incident_id: str, limit: int = 100,
+        cursor: dict[str, Any] | None = None,
+    ) -> Page:
         if not 1 <= limit <= 100:
             raise ValueError("history limit must be 1-100")
-        return self.gateway.query_range(
-            self.incident_table, f"INCIDENT#{incident_id}", "HIST#", "HIST#~", limit
+        return self.gateway.query_range_page(
+            self.incident_table, f"INCIDENT#{incident_id}", "HIST#", "HIST#~",
+            limit, cursor,
         )
 
     def update_incident(

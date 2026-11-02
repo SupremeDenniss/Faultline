@@ -19,6 +19,12 @@ class Put:
     expected_revision: int | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class Page:
+    items: list[dict[str, Any]]
+    cursor: dict[str, Any] | None
+
+
 class Gateway(Protocol):
     def get(self, table: str, pk: str, sk: str) -> dict[str, Any] | None: ...
 
@@ -28,7 +34,15 @@ class Gateway(Protocol):
         self, table: str, pk: str, start: str, end: str, limit: int
     ) -> list[dict[str, Any]]: ...
 
-    def query_account(self, table: str, account_id: str, limit: int) -> list[dict[str, Any]]: ...
+    def query_range_page(
+        self, table: str, pk: str, start: str, end: str, limit: int,
+        cursor: dict[str, Any] | None = None,
+    ) -> Page: ...
+
+    def query_account_page(
+        self, table: str, account_id: str, limit: int,
+        cursor: dict[str, Any] | None = None,
+    ) -> Page: ...
 
     def transact(self, puts: list[Put]) -> None: ...
 
@@ -80,7 +94,21 @@ class Boto3Gateway:
     def query_range(
         self, table: str, pk: str, start: str, end: str, limit: int
     ) -> list[dict[str, Any]]:
-        response = self.client.query(
+        items: list[dict[str, Any]] = []
+        cursor = None
+        while len(items) < limit:
+            page = self.query_range_page(table, pk, start, end, limit - len(items), cursor)
+            items.extend(page.items)
+            cursor = page.cursor
+            if cursor is None:
+                break
+        return items
+
+    def query_range_page(
+        self, table: str, pk: str, start: str, end: str, limit: int,
+        cursor: dict[str, Any] | None = None,
+    ) -> Page:
+        params: dict[str, Any] = dict(
             TableName=table,
             KeyConditionExpression="#pk = :pk AND #sk BETWEEN :start AND :end",
             ExpressionAttributeNames={"#pk": "pk", "#sk": "sk"},
@@ -91,10 +119,20 @@ class Boto3Gateway:
             },
             ConsistentRead=True, Limit=limit,
         )
-        return [self._plain(item) for item in response.get("Items", [])]
+        if cursor is not None:
+            params["ExclusiveStartKey"] = self._item(cursor)
+        response = self.client.query(**params)
+        return Page(
+            [self._plain(item) for item in response.get("Items", [])],
+            self._plain(response["LastEvaluatedKey"])
+            if response.get("LastEvaluatedKey") else None,
+        )
 
-    def query_account(self, table: str, account_id: str, limit: int) -> list[dict[str, Any]]:
-        response = self.client.query(
+    def query_account_page(
+        self, table: str, account_id: str, limit: int,
+        cursor: dict[str, Any] | None = None,
+    ) -> Page:
+        params: dict[str, Any] = dict(
             TableName=table, IndexName="AccountTime",
             KeyConditionExpression="#gpk = :account",
             ExpressionAttributeNames={"#gpk": "gsi1pk"},
@@ -103,7 +141,14 @@ class Boto3Gateway:
             },
             ScanIndexForward=False, Limit=limit,
         )
-        return [self._plain(item) for item in response.get("Items", [])]
+        if cursor is not None:
+            params["ExclusiveStartKey"] = self._item(cursor)
+        response = self.client.query(**params)
+        return Page(
+            [self._plain(item) for item in response.get("Items", [])],
+            self._plain(response["LastEvaluatedKey"])
+            if response.get("LastEvaluatedKey") else None,
+        )
 
     def transact(self, puts: list[Put]) -> None:
         if not 1 <= len(puts) <= 100:
